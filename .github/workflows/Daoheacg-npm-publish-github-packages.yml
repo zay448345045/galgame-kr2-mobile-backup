@@ -1,13 +1,15 @@
 # This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
 # For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
 
-name: Node.js Package
+name: daoheacg Node.js Package
+
+#name: Universal Relay Harvester
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: '单次链接或Release页面（留空则使用 urls.txt 接力模式）'
+        description: '单次或多个链接（支持用逗号 , 或分号 ; 分隔，留空则使用 urls.txt 接力模式）'
         required: false
         type: string
       current_index:
@@ -32,7 +34,7 @@ jobs:
 
     steps:
       - name: 1. 检出配置
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -45,23 +47,25 @@ jobs:
       - name: 3. 智能解析与准备链接清单及元数据
         id: prepare
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          SP_COOKIE: ${{ secrets.git }}
         run: |
           mkdir -p download_zone
           
-          # 1. 提取原始链接列表
+          # 1. 提取原始链接列表（支持逗号、分号及换行分隔）
           if [ -n "${{ github.event.inputs.file_url }}" ]; then
-            echo "启用单次输入模式..."
-            echo "${{ github.event.inputs.file_url }}" | tr ',' '\n' | sed '/^$/d' > raw_urls.txt
+            echo "启用手动输入模式..."
+            echo "${{ github.event.inputs.file_url }}" | tr ',;' '\n\n' | sed 's/\r//g; /^$/d' > raw_urls.txt
+            RAW_COUNT=$(wc -l < raw_urls.txt)
             echo "is_relay=false" >> $GITHUB_OUTPUT
-            echo "raw_count=1" >> $GITHUB_OUTPUT
+            echo "raw_count=$RAW_COUNT" >> $GITHUB_OUTPUT
           else
             echo "启用 urls.txt 接力模式..."
             if [ ! -f "urls.txt" ]; then
               echo "❌ 错误: 仓库根目录未找到 urls.txt 文件！"
               exit 1
             fi
-            sed -i 's/,/\n/g; s/\r//g; /^$/d' urls.txt
+            sed -i 's/[;,]/\n/g; s/\r//g; /^$/d' urls.txt
             START=${{ github.event.inputs.current_index }}
             SIZE=${{ github.event.inputs.batch_size }}
             
@@ -73,7 +77,7 @@ jobs:
 
           # 2. 智能解析并提取完整 Release 说明
           python3 -c "import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
-            import sys, re, json, subprocess
+            import sys, re, json, subprocess, urllib.parse
 
             def resolve_url(line):
                 line = line.strip()
@@ -82,12 +86,13 @@ jobs:
                 if "/releases/download/" in line:
                     gh_match = re.match(r"https?://github\.com/([^/]+)/([^/]+)", line)
                     repo_str = f"{gh_match.group(1)}/{gh_match.group(2).replace('.git','')}" if gh_match else "直链"
+                    clean_filename = urllib.parse.unquote(line.split('/')[-1].split('?')[0])
                     return [{
                         "download_url": line,
                         "repo": repo_str,
                         "tag": "Direct Link",
-                        "title": line.split('/')[-1].split('?')[0],
-                        "notes": "直链附件，未通过 API 匹配完整 Release Notes"
+                        "title": clean_filename,
+                        "notes": "GitHub 直链附件，未通过 API 匹配完整 Release Notes"
                     }]
 
                 gh_match = re.match(r"https?://github\.com/([^/]+)/([^/]+)(/releases.*)?", line)
@@ -97,17 +102,16 @@ jobs:
                     tag_match = re.search(r"/releases/tag/([^/]+)", line)
                     
                     try:
+                        jq_filter = '{tag: .tag_name, name: (.name // .tag_name), body: (.body // ""), assets: [.assets[].browser_download_url]}'
                         if tag_match:
                             tag = tag_match.group(1)
-                            jq_filter = '{tag: .tag_name, name: (.name // .tag_name), body: (.body // ""), assets: [.assets[].browser_download_url]}'
                             cmd = ["gh", "api", f"repos/{owner}/{repo}/releases/tags/{tag}", "--jq", jq_filter]
                             res = subprocess.check_output(cmd, text=True).strip()
                             rel_data = [json.loads(res)] if res else []
                         else:
-                            jq_filter = '[.[] | {tag: .tag_name, name: (.name // .tag_name), body: (.body // ""), assets: [.assets[].browser_download_url]}]'
-                            cmd = ["gh", "api", "--paginate", f"repos/{owner}/{repo}/releases", "--jq", jq_filter]
+                            cmd = ["gh", "api", f"repos/{owner}/{repo}/releases", "--paginate", "--jq", jq_filter]
                             res = subprocess.check_output(cmd, text=True).strip()
-                            rel_data = json.loads(res) if res else []
+                            rel_data = [json.loads(line) for line in res.splitlines() if line.strip()]
                         
                         results = []
                         for rel in rel_data:
@@ -140,12 +144,13 @@ jobs:
                             "notes": f"解析失败: {str(e)}"
                         }]
 
+                clean_filename = urllib.parse.unquote(line.split('/')[-1].split('?')[0])
                 return [{
                     "download_url": line,
-                    "repo": "普通直链",
+                    "repo": "第三方直链/GitCode",
                     "tag": "N/A",
-                    "title": line.split('/')[-1].split('?')[0],
-                    "notes": "非 GitHub 链接"
+                    "title": clean_filename,
+                    "notes": f"非 GitHub 官方链接，原始 URL: {line}"
                 }]
 
             with open("raw_urls.txt", "r") as f:
@@ -172,7 +177,7 @@ jobs:
       - name: 4. 创建全新的独立 Release
         id: create_release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
         run: |
           START=${{ github.event.inputs.current_index }}
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -188,7 +193,8 @@ jobs:
       - name: 5. 多线程并发下载、即时上传并生成对应说明
         id: worker
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          SP_COOKIE: ${{ secrets.daoheacg }}
         run: |
           TARGET_TAG="${{ steps.create_release.outputs.release_tag }}"
           START_IDX=${{ github.event.inputs.current_index }}
@@ -196,13 +202,14 @@ jobs:
           RAW_COUNT=${{ steps.prepare.outputs.raw_count }}
 
           python3 -c "import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))" "$TARGET_TAG" "$START_IDX" "$WORKERS" << 'EOF'
-            import os, sys, re, json, urllib.parse, subprocess, threading
+            import os, sys, re, json, urllib.parse, subprocess, threading, time
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
             target_tag = sys.argv[1]
             start_idx = sys.argv[2]
             max_workers = int(sys.argv[3])
             dl_dir = os.path.abspath("download_zone")
+            sp_cookie = os.environ.get("SP_COOKIE", "").strip()
 
             if not os.path.exists("current_batch.json"):
                 sys.exit(0)
@@ -231,21 +238,32 @@ jobs:
 
                 curl_cmd = [
                     "curl", "-L", "-A", "Mozilla/5.0",
-                    "--retry", "3", "--retry-delay", "5", "--fail",
-                    "-s", "-S", url, "-o", local_path
+                    "--retry", "5", "--retry-delay", "3", "--fail",
+                    "-s", "-S"
                 ]
+                
+                if sp_cookie:
+                    curl_cmd.extend(["-H", f"Cookie: {sp_cookie}"])
+
+                curl_cmd.extend([url, "-o", local_path])
                 res = subprocess.run(curl_cmd)
 
                 status = "失败"
                 if res.returncode == 0 and os.path.exists(local_path):
                     print(f"⬆️ [{idx+1}/{total}] 上传至 Release: {unique_name}")
-                    up_cmd = ["gh", "release", "upload", target_tag, local_path]
-                    up_res = subprocess.run(up_cmd)
+                    
+                    up_res = None
+                    for attempt in range(3):
+                        up_cmd = ["gh", "release", "upload", target_tag, local_path, "--clobber"]
+                        up_res = subprocess.run(up_cmd)
+                        if up_res.returncode == 0:
+                            break
+                        time.sleep(2)
 
                     if os.path.exists(local_path):
                         os.remove(local_path)
 
-                    if up_res.returncode == 0:
+                    if up_res and up_res.returncode == 0:
                         print(f"✅ [{idx+1}/{total}] 成功: {unique_name}")
                         status = "成功"
                     else:
@@ -319,7 +337,7 @@ jobs:
                 f.write(full_md[:120000])
 
             print("📄 正在上传 00_RELEASE_NOTES.md 附件...")
-            subprocess.run(["gh", "release", "upload", target_tag, notes_file_path])
+            subprocess.run(["gh", "release", "upload", target_tag, notes_file_path, "--clobber"])
 
             print("🎉 本轮并发任务全部结束！")
           EOF
@@ -345,4 +363,4 @@ jobs:
             -f batch_size=${{ github.event.inputs.batch_size }} \
             -f concurrent_jobs=${{ github.event.inputs.concurrent_jobs }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}

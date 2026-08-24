@@ -1,9 +1,4 @@
-# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
-# For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
-
 name: daoheacg Node.js Package
-
-#name: Universal Relay Harvester
 
 on:
   workflow_dispatch:
@@ -24,6 +19,10 @@ on:
         description: '并发线程数 (建议 4-8)'
         required: true
         default: '4'
+      volume_size:
+        description: '超 2GB 单文件切片大小 (如 1900m)'
+        required: false
+        default: '1900m'
 
 jobs:
   harvester:
@@ -190,7 +189,7 @@ jobs:
           
           echo "release_tag=$NEW_TAG" >> $GITHUB_OUTPUT
 
-      - name: 5. 多线程并发下载、即时上传并生成对应说明
+      - name: 5. 多线程并发下载、自动切片上传并生成说明
         id: worker
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
@@ -199,15 +198,17 @@ jobs:
           TARGET_TAG="${{ steps.create_release.outputs.release_tag }}"
           START_IDX=${{ github.event.inputs.current_index }}
           WORKERS=${{ github.event.inputs.concurrent_jobs }}
+          VOL_SIZE="${{ github.event.inputs.volume_size }}"
           RAW_COUNT=${{ steps.prepare.outputs.raw_count }}
 
-          python3 -c "import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))" "$TARGET_TAG" "$START_IDX" "$WORKERS" << 'EOF'
-            import os, sys, re, json, urllib.parse, subprocess, threading, time
+          python3 -c "import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))" "$TARGET_TAG" "$START_IDX" "$WORKERS" "$VOL_SIZE" << 'EOF'
+            import os, sys, re, json, urllib.parse, subprocess, threading, time, shutil
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
             target_tag = sys.argv[1]
             start_idx = sys.argv[2]
             max_workers = int(sys.argv[3])
+            volume_size = sys.argv[4]
             dl_dir = os.path.abspath("download_zone")
             sp_cookie = os.environ.get("SP_COOKIE", "").strip()
 
@@ -225,6 +226,19 @@ jobs:
                 idx, item = item_data
                 url = item["download_url"]
 
+                # 磁盘空间监控 (低于 5GB 触发保护)
+                free_mb = shutil.disk_usage(dl_dir).free / (1024 * 1024)
+                if free_mb < 5120:
+                    print(f"⚠️ [{idx+1}/{total}] 磁盘容量不足 5GB ({free_mb:.0f}MB)，熔断并跳过此任务: {url}")
+                    with lock:
+                        processed_records.append({
+                            "idx": idx, "unique_name": "N/A", "raw_filename": url,
+                            "repo": item.get("repo", "N/A"), "tag": item.get("tag", "N/A"),
+                            "title": item.get("title", "N/A"), "notes": item.get("notes", "无说明"),
+                            "status": "跳过(磁盘熔断)", "url": url
+                        })
+                    return
+
                 raw_filename = urllib.parse.unquote(url.split('/')[-1].split('?')[0])
                 safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', raw_filename)
                 safe_name = re.sub(r'_+', '_', safe_name).strip('_')
@@ -241,33 +255,64 @@ jobs:
                     "--retry", "5", "--retry-delay", "3", "--fail",
                     "-s", "-S"
                 ]
-                
                 if sp_cookie:
                     curl_cmd.extend(["-H", f"Cookie: {sp_cookie}"])
-
                 curl_cmd.extend([url, "-o", local_path])
+                
                 res = subprocess.run(curl_cmd)
-
                 status = "失败"
+
                 if res.returncode == 0 and os.path.exists(local_path):
-                    print(f"⬆️ [{idx+1}/{total}] 上传至 Release: {unique_name}")
-                    
-                    up_res = None
-                    for attempt in range(3):
-                        up_cmd = ["gh", "release", "upload", target_tag, local_path, "--clobber"]
-                        up_res = subprocess.run(up_cmd)
-                        if up_res.returncode == 0:
-                            break
-                        time.sleep(2)
+                    file_size = os.path.getsize(local_path)
+                    max_bytes = 1900 * 1024 * 1024  # 1.9GB 阀值
+                    files_to_upload = []
 
-                    if os.path.exists(local_path):
-                        os.remove(local_path)
+                    # 触发 7z 快速分卷打包逻辑 (-mx0 不做 CPU 压缩，只进行切割)
+                    if file_size > max_bytes:
+                        print(f"📦 [{idx+1}/{total}] {unique_name} 大小为 {file_size/1024/1024:.2f}MB (超出 2GB 限制)，开启 7z 切片 (-v{volume_size})...")
+                        archive_base = os.path.join(dl_dir, f"{unique_name}.7z")
+                        split_cmd = ["7z", "a", f"-v{volume_size}", "-mx0", archive_base, local_path]
+                        split_res = subprocess.run(split_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                        
+                        if split_res.returncode == 0:
+                            os.remove(local_path) # 删除原超大文件
+                            parent_dir = os.path.dirname(archive_base)
+                            base_name = os.path.basename(archive_base)
+                            files_to_upload = [
+                                os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
+                                if f == base_name or f.startswith(f"{base_name}.")
+                            ]
+                            files_to_upload.sort()
+                        else:
+                            print(f"⚠️ [{idx+1}/{total}] 7z 分卷失败，尝试直接上传原文件...")
+                            files_to_upload = [local_path]
+                    else:
+                        files_to_upload = [local_path]
 
-                    if up_res and up_res.returncode == 0:
-                        print(f"✅ [{idx+1}/{total}] 成功: {unique_name}")
+                    # 批量上传切片或单独文件
+                    upload_success = True
+                    for upload_file in files_to_upload:
+                        fname = os.path.basename(upload_file)
+                        print(f"⬆️ [{idx+1}/{total}] 上传至 Release: {fname}")
+                        up_ok = False
+                        for attempt in range(3):
+                            up_cmd = ["gh", "release", "upload", target_tag, upload_file, "--clobber"]
+                            if subprocess.run(up_cmd).returncode == 0:
+                                up_ok = True
+                                break
+                            time.sleep(2)
+                        
+                        if os.path.exists(upload_file):
+                            os.remove(upload_file)
+                            
+                        if not up_ok:
+                            upload_success = False
+
+                    if upload_success:
+                        print(f"✅ [{idx+1}/{total}] 成功处理: {unique_name}")
                         status = "成功"
                     else:
-                        print(f"⚠️ [{idx+1}/{total}] 上传失败: {unique_name}")
+                        print(f"⚠️ [{idx+1}/{total}] 上传存在失败项: {unique_name}")
                 else:
                     print(f"⚠️ [{idx+1}/{total}] 下载失败: {url}")
 
@@ -361,6 +406,7 @@ jobs:
           gh workflow run "${{ github.workflow }}" \
             -f current_index=${{ steps.worker.outputs.next_idx }} \
             -f batch_size=${{ github.event.inputs.batch_size }} \
-            -f concurrent_jobs=${{ github.event.inputs.concurrent_jobs }}
+            -f concurrent_jobs=${{ github.event.inputs.concurrent_jobs }} \
+            -f volume_size=${{ github.event.inputs.volume_size }}
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}

@@ -193,7 +193,7 @@ jobs:
         id: worker
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
-          SP_COOKIE: ${{ secrets.daoheacg }}
+          SP_COOKIE: ${{ secrets.quack }}
         run: |
           TARGET_TAG="${{ steps.create_release.outputs.release_tag }}"
           START_IDX=${{ github.event.inputs.current_index }}
